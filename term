@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""term - ask Gemini a question from any terminal.
+
+Usage:
+    term what is the capital of France
+    echo "some text" | term summarize this
+"""
+import json
+import os
+import ssl
+import sys
+import urllib.error
+import urllib.request
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+DEFAULT_MODEL = "gemini-2.5-flash"
+
+
+def load_env(path):
+    if not os.path.exists(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key.strip(), value)
+
+
+def ssl_context():
+    # python.org builds on macOS often ship without CA certs; fall back gracefully.
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+    if os.path.exists("/etc/ssl/cert.pem"):
+        return ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+    return ssl.create_default_context()
+
+
+def main():
+    load_env(os.path.join(SCRIPT_DIR, ".env"))
+
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if not api_key:
+        sys.exit("term: GEMINI_API_KEY is not set. Add it to %s" % os.path.join(SCRIPT_DIR, ".env"))
+    model = os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
+
+    question = " ".join(sys.argv[1:]).strip()
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        if piped:
+            question = (question + "\n\n" + piped).strip()
+    if not question:
+        sys.exit("usage: term <your question>")
+
+    body = json.dumps({
+        "systemInstruction": {"parts": [{"text": (
+            "You are a helpful assistant answering questions in a terminal. "
+            "Be concise. Use plain text; avoid heavy markdown."
+        )}]},
+        "contents": [{"role": "user", "parts": [{"text": question}]}],
+    }).encode()
+
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/%s:streamGenerateContent?alt=sse"
+           % model)
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    })
+
+    try:
+        with urllib.request.urlopen(req, context=ssl_context()) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = json.loads(line[5:])
+                for cand in chunk.get("candidates", []):
+                    for part in cand.get("content", {}).get("parts", []):
+                        sys.stdout.write(part.get("text", ""))
+                        sys.stdout.flush()
+        print()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        try:
+            detail = json.loads(detail)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            pass
+        sys.exit("term: Gemini API error %s: %s" % (e.code, detail))
+    except urllib.error.URLError as e:
+        sys.exit("term: network error: %s" % e.reason)
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
